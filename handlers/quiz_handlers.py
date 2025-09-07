@@ -3,7 +3,14 @@ from aiogram.filters import Command
 import aiosqlite
 from data.quiz_data import quiz_data
 from utils.keyboards import generate_options_keyboard
-from database.db_operations import get_quiz_index, update_quiz_index, update_user_stats, update_last_score
+from database.db_operations import (
+    get_quiz_index, 
+    update_quiz_index, 
+    update_current_attempt, 
+    start_new_attempt, 
+    finish_attempt,
+    get_current_attempt_stats  # Импортируем новую функцию
+)
 from config.config import DB_NAME
 
 router = Router()
@@ -17,6 +24,7 @@ async def cmd_quiz(message: types.Message):
 async def new_quiz(message):
     user_id = message.from_user.id
     await update_quiz_index(user_id, 0)
+    await start_new_attempt(user_id)
     await get_question(message, user_id)
 
 async def get_question(message, user_id):
@@ -40,22 +48,18 @@ async def right_answer(callback: types.CallbackQuery):
     current_question_index = await get_quiz_index(user_id)
     selected_index = int(callback.data.split("_")[1])
     
-    # Удаляем кнопки
     await callback.bot.edit_message_reply_markup(
         chat_id=user_id,
         message_id=callback.message.message_id,
         reply_markup=None
     )
     
-    # Показываем выбранный ответ
     selected_option = quiz_data[current_question_index]['options'][selected_index]
     await callback.message.answer(f"✅ Вы выбрали: {selected_option}")
     await callback.message.answer("🎯 Верно!")
     
-    # Обновляем статистику
-    await update_user_stats(user_id, callback.from_user.username, True)
+    await update_current_attempt(user_id, True)
     
-    # Переходим к следующему вопросу
     current_question_index += 1
     await update_quiz_index(user_id, current_question_index)
     
@@ -70,14 +74,12 @@ async def wrong_answer(callback: types.CallbackQuery):
     current_question_index = await get_quiz_index(user_id)
     selected_index = int(callback.data.split("_")[1])
     
-    # Удаляем кнопки
     await callback.bot.edit_message_reply_markup(
         chat_id=user_id,
         message_id=callback.message.message_id,
         reply_markup=None
     )
     
-    # Показываем выбранный ответ
     selected_option = quiz_data[current_question_index]['options'][selected_index]
     await callback.message.answer(f"❌ Вы выбрали: {selected_option}")
     
@@ -87,10 +89,8 @@ async def wrong_answer(callback: types.CallbackQuery):
     if 'explanation' in quiz_data[current_question_index]:
         await callback.message.answer(f"💡 {quiz_data[current_question_index]['explanation']}")
     
-    # Обновляем статистику
-    await update_user_stats(user_id, callback.from_user.username, False)
+    await update_current_attempt(user_id, False)
     
-    # Переходим к следующему вопросу
     current_question_index += 1
     await update_quiz_index(user_id, current_question_index)
     
@@ -100,23 +100,14 @@ async def wrong_answer(callback: types.CallbackQuery):
         await finish_quiz(callback.message, user_id)
 
 async def finish_quiz(message, user_id):
-    # Получаем статистику
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute('''SELECT total_correct, total_wrong FROM user_stats 
-                              WHERE user_id = ?''', (user_id,)) as cursor:
-            stats = await cursor.fetchone()
+    # Завершаем попытку и получаем статистику ТОЛЬКО этой попытки
+    correct, wrong, score = await finish_attempt(user_id, message.from_user.username)
     
-    if stats:
-        correct, wrong = stats
-        total = correct + wrong
-        score = int((correct / total) * 100) if total > 0 else 0
-        
-        await update_last_score(user_id, score)
-        
+    if correct + wrong == len(quiz_data):  # Проверяем, что прошли все вопросы
         result_text = f"""
         🎉 Квиз завершен!
         
-        📊 Ваш результат:
+        📊 Результат этой попытки:
         ✅ Правильных ответов: {correct}
         ❌ Неправильных ответов: {wrong}
         🎯 Точность: {score}%
@@ -125,9 +116,21 @@ async def finish_quiz(message, user_id):
           '⚔️ Хороший результат! Продолжайте тренироваться!' if score >= 60 else 
           '🔥 Нужно больше практики! Играйте снова!'}
         
-        🎮 Хотите попробовать еще раз? /quiz
+        📊 Посмотреть общую статистику: /stats
+        🎮 Начать новую попытку: /quiz
         """
     else:
-        result_text = "🎉 Квиз завершен! 🎮 Начните заново: /quiz"
+        result_text = "⚠️ Что-то пошло не так. Попробуйте начать заново: /quiz"
     
     await message.answer(result_text)
+
+@router.message(Command("reset_stats"))
+async def cmd_reset_stats(message: types.Message):
+    user_id = message.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('DELETE FROM user_stats WHERE user_id = ?', (user_id,))
+        await db.execute('DELETE FROM current_attempt WHERE user_id = ?', (user_id,))
+        await db.execute('DELETE FROM quiz_state WHERE user_id = ?', (user_id,))
+        await db.commit()
+    
+    await message.answer("🔄 Вся статистика сброшена! Начните заново: /quiz")
